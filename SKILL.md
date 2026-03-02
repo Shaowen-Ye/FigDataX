@@ -69,7 +69,7 @@ Uses multi-point axis calibration + color-based detection for maximum precision.
 3. **Sub-pixel centroid refinement** — Gaussian-weighted, inspired by Engauge Digitizer
 4. **Color-distance metric** — robust matching in HSV space, inspired by WebPlotDigitizer
 
-### Step 1: Load and view the image
+### Step 1: Load, view, and classify the image
 
 ```python
 import cv2
@@ -79,10 +79,14 @@ img = cv2.imread("figure.png")
 Use the Read tool to view the figure image. Identify:
 - **Chart type**: bar, grouped bar, stacked bar, line, scatter, box, violin, heatmap, pie, polar
 - **Axes**: labels, units, scale type (linear / log / log-log / reciprocal / date)
+- **X-axis type**: **categorical** (named groups, time labels) or **continuous** (numeric range)
 - **Tick marks**: exact values at each tick on both axes
 - **Data series**: count, legend labels, visual encoding (color, marker, line style)
+- **Color uniqueness**: Do series have **distinct colors** → use color detection. Or **all same color** (e.g., all black) → use morphological detection + shape/style tracking
 - **Markers**: shape (circle, diamond, square, triangle), size, fill — the **geometric center** of each marker is the true data point, not its edge
 - **Grid**: major and minor gridlines (may need removal before color detection)
+
+**Efficiency decision**: If X-axis is categorical (e.g., "3:00, 6:00, 9:00..." or "Spring, Summer, Autumn"), skip X-axis calibration entirely — use category indices. Only calibrate the Y-axis. This halves the calibration work.
 
 ### Step 2: Detect or specify the plot area
 
@@ -150,7 +154,7 @@ cleaned_img = remove_grid(img, grid_color_hsv=(0, 0, 200), method="hough")
 **Critical: Marker centers are the data points.** Scientific charts often use visible markers (circles, diamonds, squares, triangles) on data points. These markers can be large (10-20px diameter). The true data value corresponds to the **geometric center** of the marker, not its edge or any arbitrary pixel within it. When markers are large, reading the edge instead of the center can introduce errors of 5-10% of the axis range.
 
 **Recommended approach — coordinate grid overlay for manual reading:**
-When markers are large or multiple series share the same color (e.g., two black curves distinguished only by line style), automated detection may fail. In such cases, generate a fine coordinate grid overlay on the image and manually read each marker's center pixel coordinates:
+When markers are large or multiple series share the same color, generate a 3-level coordinate grid overlay on the image for visual reading:
 
 ```python
 import cv2
@@ -160,19 +164,15 @@ img = cv2.imread("figure.png")
 overlay = img.copy()
 h, w = overlay.shape[:2]
 
-# Draw fine grid (25px spacing) with pixel coordinate labels
-for x in range(0, w, 25):
-    cv2.line(overlay, (x, 0), (x, h), (200, 200, 200), 1)
-    if x % 100 == 0:
-        cv2.putText(overlay, str(x), (x+2, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 0, 0), 1)
-for y in range(0, h, 25):
-    cv2.line(overlay, (0, y), (w, y), (200, 200, 200), 1)
-    if y % 100 == 0:
-        cv2.putText(overlay, str(y), (2, y+12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 0, 0), 1)
-
-cv2.imwrite("debug_fine_grid.png", overlay)
+# Use generate_grid_overlay() — default spacing (10, 50, 200)
+from scripts.figdatax import generate_grid_overlay
+generate_grid_overlay(img, "figure_grid.png")
+# Or with custom plot area restriction:
+# generate_grid_overlay(img, "figure_grid.png", plot_bbox=(110, 30, 910, 460))
 # View this image, then read each marker CENTER's (x_px, y_px)
 ```
+
+**Grid density:** Default **10px fine + 50px mid + 200px major** (3-level). Fine grid at 10px gives ±5px reading precision (~±0.01 data units on typical charts). Mid grid labels at 50px intervals provide quick coordinate reference. Do NOT use ultra-fine grids (2-3px) — they obscure the underlying image.
 
 Then build a manual pixel lookup and apply the calibration:
 ```python
@@ -415,6 +415,127 @@ Saved to: /path/to/figure2a_extracted.csv
 Validation: /path/to/figure2a_validation.png
 ```
 
+## Efficiency Guidelines — Balancing Precision and Cost
+
+**Core principle: Do the extraction in ONE consolidated script.** Avoid multi-round iterative exploration. Read the image once, identify chart type, write one script that calibrates + detects + extracts + validates in a single run. Iterative pixel scanning and repeated grid generation waste tokens.
+
+### When to simplify
+
+| Situation | Shortcut | Skip |
+|-----------|----------|------|
+| **Categorical X-axis** (time labels, group names) | Use category index directly; only calibrate Y-axis | X-axis calibration |
+| **Clean axis labels** visible in image | Read tick values directly from image; use `np.polyfit(tick_px, tick_val, 1)` | `calibrate_axes_multipoint` if only 1 axis needs fitting |
+| **No grid lines** in the chart | Skip grid removal | Step 4 entirely |
+| **Well-separated colored series** | Use automated color detection | Manual grid overlay reading |
+| **All-black same-color markers** | Use morphological detection (see below) | Color-based extraction |
+
+### Grid overlay density
+
+Use **10px fine grid + 50px mid grid + 200px major grid** (3-level). The 10px fine grid gives ~10 subdivisions per 100px span — each marker (typically 10-20px) has 1-2 grid lines through it for precise center reading to ±5px (~±0.01 data units). Mid grid labels at 50px provide quick coordinate lookups. Do NOT use 2-3px ultra-fine grids — they obscure the underlying image without meaningful precision gain.
+
+### One-script extraction pattern
+
+```python
+import cv2, numpy as np, pandas as pd, matplotlib.pyplot as plt
+
+img = cv2.imread("figure.png")
+gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+# 1. Y-axis calibration (linear fit from tick label positions)
+tick_y_px  = [55, 121, 187, 253, 319, 386, 473]  # read from grid overlay
+tick_y_val = [3.0, 2.5, 2.0, 1.5, 1.0, 0.5, 0.0]
+coeffs = np.polyfit(tick_y_px, tick_y_val, 1)
+py2v = np.poly1d(coeffs)
+
+# 2. Detect markers (morphological or color-based)
+# ... (see sections below)
+
+# 3. Assign series + convert pixels to values
+# ... build DataFrame
+
+# 4. Save CSV + validation plot
+df.to_csv("figure_extracted.csv", index=False, encoding="utf-8-sig")
+# ... matplotlib side-by-side plot
+```
+
+---
+
+## Same-Color Multi-Series Detection (Morphological Method)
+
+When all data series share the same color (e.g., black lines with different marker shapes or line styles), color-based extraction fails. Use **morphological erosion/dilation** to separate markers from connecting lines.
+
+### Pipeline
+
+```python
+import cv2
+import numpy as np
+
+img = cv2.imread("figure.png")
+gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+# 1. Binary threshold — dark pixels = markers + lines + text
+_, dark = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
+
+# 2. Mask to plot area only, exclude legend
+plot_mask = np.zeros_like(dark)
+plot_mask[y1:y2, x1:x2] = dark[y1:y2, x1:x2]
+plot_mask[leg_y1:leg_y2, leg_x1:leg_x2] = 0  # exclude legend
+
+# 3. Morphological erosion — removes thin lines (~2-3px), keeps thick markers (~8-15px)
+kernel = np.ones((4, 4), np.uint8)  # 4x4 kernel, 1 iteration
+eroded = cv2.erode(plot_mask, kernel, iterations=1)
+dilated = cv2.dilate(eroded, kernel, iterations=1)  # restore marker size
+
+# 4. Find contours, filter by area and aspect ratio
+contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+markers = []
+for c in contours:
+    area = cv2.contourArea(c)
+    if 60 < area < 300:  # typical marker area range
+        M = cv2.moments(c)
+        if M['m00'] > 0:
+            cx, cy = M['m10']/M['m00'], M['m01']/M['m00']
+            x, y, bw, bh = cv2.boundingRect(c)
+            if 0.6 < bw/max(bh,1) < 1.5 and bw < 20:  # roughly square
+                markers.append((cx, cy, area))
+```
+
+### Tuning the erosion kernel
+
+| Kernel size | Effect | Use when |
+|-------------|--------|----------|
+| 3×3, 1 iter | Removes ~1px lines, keeps ~5px+ markers | Thin lines, small markers |
+| **4×4, 1 iter** | **Removes ~2-3px lines, keeps ~8px+ markers** | **Default — works for most charts** |
+| 5×5, 1 iter | Removes ~3-4px lines, keeps ~10px+ markers | Thick lines, large markers |
+
+If too many line fragments survive: increase kernel size. If markers disappear: decrease kernel size or reduce iterations.
+
+### Series assignment with crossover handling
+
+When detected markers are grouped by X-position (3 markers per time point), assign each to the correct series by **tracing the curve pattern** — NOT by assuming a fixed top-to-bottom order:
+
+```python
+# Group markers by x-position (cluster within 25px tolerance)
+groups = cluster_by_x(markers, tolerance=25)
+
+# For each group, sort by cy (ascending = highest value first)
+# Then assign to series based on KNOWN curve behavior:
+# - Which series is consistently highest/lowest?
+# - Do any series CROSS at certain x-positions?
+# Key: track the crossover point and swap assignments after it
+```
+
+**Common pitfalls:**
+- Two series that cross (e.g., Summer rises while Autumn falls) will swap their top-to-bottom order mid-chart
+- Two markers may **overlap** when series values are nearly equal (e.g., both ≈0.55) — only one blob is detected. Must identify the missing series and use manual reading or the average value.
+- The **legend region** can produce false marker detections if not excluded
+
+### Hollow markers
+
+Some markers are **hollow** (outline only, white fill). Their geometric center is a WHITE pixel, not a dark one. Programmatic color-based detection finds the outline ring, and `cv2.moments()` correctly computes the centroid of that ring — which IS the geometric center. Do not be confused by the white center pixel when visually reading.
+
+---
+
 ## Precision Best Practices
 
 1. **Resolution matters**: Ask user for highest resolution figure. Extract from PDF as 300+ DPI PNG.
@@ -425,6 +546,8 @@ Validation: /path/to/figure2a_validation.png
 6. **Sub-pixel refinement**: Always enable `subpixel=True` for data point detection.
 7. **Dual Y-axis**: Calibrate each axis separately with its own tick marks.
 8. **Legend contamination**: Filter out false detections from legend box text/symbols that overlap with the plot area. Exclude the legend bounding box region before marker detection.
-9. **Same-color curves**: When multiple curves share the same color (e.g., solid vs dashed black lines), automated color-based separation fails. Use the coordinate grid overlay + manual reading approach instead.
-10. **Report uncertainty**: State extraction method and calibration RMSE in every output.
-11. **Validation overlay**: Always generate — it's the most reliable way to catch errors.
+9. **Same-color curves**: When multiple curves share the same color, use the morphological erosion pipeline (see above) instead of color-based extraction.
+10. **Curve crossover**: When assigning markers to series, track where curves cross and swap the assignment order accordingly. Do NOT assume a fixed top-to-bottom mapping.
+11. **Overlapping markers**: When two series have nearly equal values at a time point, their markers overlap into one blob. Detect this (group has fewer markers than expected) and supplement with manual reading or interpolation.
+12. **Report uncertainty**: State extraction method and calibration RMSE in every output.
+13. **Validation overlay**: Always generate — it's the most reliable way to catch errors.

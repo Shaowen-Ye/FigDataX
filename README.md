@@ -246,6 +246,10 @@ from scripts.figdatax import (
     split_panels,                # Multi-panel figure splitting
     detect_axes_hough,           # Hough-based axis detection
     extract_polar,               # Polar plot extraction
+    generate_grid_overlay,       # 3-level coordinate grid overlay generation
+    detect_markers_morphological,# Morphological marker detection (same-color series)
+    cluster_markers_by_x,        # Group markers by X position
+    assign_series_with_crossover,# Series assignment with crossover tracking
     create_validation_plot,      # Validation overlay generation
 )
 ```

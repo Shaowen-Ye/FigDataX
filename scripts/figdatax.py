@@ -908,7 +908,345 @@ def extract_polar(img, center, r_range, theta_range=(0, 360),
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  13. VALIDATION PLOT
+#  13. GRID OVERLAY GENERATION
+# ═══════════════════════════════════════════════════════════════════
+
+def generate_grid_overlay(img_or_path, output_path=None,
+                           spacing=(10, 50, 200),
+                           plot_bbox=None):
+    """
+    Generate a coordinate grid overlay on the image for precise manual
+    pixel reading. Uses 3-level grid density (fine/mid/major).
+
+    Args:
+        img_or_path: BGR image or file path
+        output_path: path to save overlay image (auto-generated if None)
+        spacing: (fine, mid, major) grid spacing in pixels. Default (10, 50, 200).
+            - fine=10px: light gray, ±5px reading precision (~±0.01 data units)
+            - mid=50px: dark gray with small coordinate labels
+            - major=200px: red with large coordinate labels
+        plot_bbox: (left, top, right, bottom) to restrict fine/mid grid.
+            Major grid and labels always cover full image. None = full image for all.
+
+    Returns:
+        overlay image (BGR numpy array), and saves to output_path if given.
+    """
+    if isinstance(img_or_path, str):
+        img = cv2.imread(img_or_path)
+        if output_path is None:
+            base, ext = os.path.splitext(img_or_path)
+            output_path = f"{base}_grid.png"
+    else:
+        img = img_or_path
+
+    overlay = img.copy()
+    h, w = overlay.shape[:2]
+
+    fine, mid, major = spacing
+
+    if plot_bbox:
+        x0, y0, x1, y1 = plot_bbox
+    else:
+        x0, y0, x1, y1 = 0, 0, w, h
+
+    # Fine grid (lightest) — within plot area
+    for x in range(x0, x1 + 1, fine):
+        cv2.line(overlay, (x, y0), (x, y1), (210, 210, 210), 1)
+    for y in range(y0, y1 + 1, fine):
+        cv2.line(overlay, (x0, y), (x1, y), (210, 210, 210), 1)
+
+    # Mid grid (dark gray) — within plot area, with small labels
+    for x in range(x0, x1 + 1, mid):
+        cv2.line(overlay, (x, y0), (x, y1), (150, 150, 150), 1)
+    for y in range(y0, y1 + 1, mid):
+        cv2.line(overlay, (x0, y), (x1, y), (150, 150, 150), 1)
+
+    # Mid grid labels (small gray, along plot edges)
+    for x in range(x0, x1 + 1, mid):
+        label_y = max(y0 - 3, 10)
+        cv2.putText(overlay, str(x), (x + 1, label_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.25, (100, 100, 100), 1)
+    for y in range(y0, y1 + 1, mid):
+        label_x = max(x0 - 28, 2)
+        cv2.putText(overlay, str(y), (label_x, y + 3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.25, (100, 100, 100), 1)
+
+    # Major grid (red) — full image extent
+    for x in range(0, w + 1, major):
+        cv2.line(overlay, (x, 0), (x, h), (0, 0, 255), 1)
+    for y in range(0, h + 1, major):
+        cv2.line(overlay, (0, y), (w, y), (0, 0, 255), 1)
+
+    # Major grid labels (red, at image edges)
+    for x in range(0, w + 1, major):
+        cv2.putText(overlay, str(x), (x + 2, 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
+    for y in range(0, h + 1, major):
+        cv2.putText(overlay, str(y), (2, y + 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
+
+    if output_path:
+        cv2.imwrite(output_path, overlay)
+
+    return overlay
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  14. MORPHOLOGICAL MARKER DETECTION (Same-Color Series)
+# ═══════════════════════════════════════════════════════════════════
+
+def detect_markers_morphological(img_or_path, plot_bbox,
+                                  legend_bbox=None,
+                                  threshold=100,
+                                  kernel_size=4,
+                                  erode_iterations=1,
+                                  area_range=(60, 300),
+                                  aspect_range=(0.6, 1.5),
+                                  max_dim=20):
+    """
+    Detect marker centers using morphological erosion/dilation.
+    Designed for charts where all series share the same color (e.g., all black)
+    and differ only by marker shape or line style.
+
+    Algorithm:
+    1. Binary threshold to get dark pixels (markers + lines + text)
+    2. Mask to plot area, exclude legend
+    3. Erode to remove thin lines (~2-3px), keep thick markers (~8-15px)
+    4. Dilate to restore marker size
+    5. Find contours, filter by area, aspect ratio, and bounding box size
+
+    Args:
+        img_or_path: BGR image or file path
+        plot_bbox: (left, top, right, bottom) plot area
+        legend_bbox: (left, top, right, bottom) legend area to exclude, or None
+        threshold: binary threshold for dark pixel detection (pixels < threshold)
+        kernel_size: erosion/dilation kernel size. Tuning guide:
+            2-3: for thin markers (3-6px), keeps more but may include line fragments
+            4:   default, good for medium markers (8-15px)
+            5-6: for large markers (15-25px), aggressive line removal
+        erode_iterations: number of erosion iterations (default 1)
+        area_range: (min, max) contour area in pixels to accept
+        aspect_range: (min, max) width/height ratio to accept (circles ≈ 1.0)
+        max_dim: max bounding box width or height (reject large text/artifacts)
+
+    Returns:
+        list of (cx, cy, area, bbox_w, bbox_h) tuples, sorted by cx
+    """
+    if isinstance(img_or_path, str):
+        img = cv2.imread(img_or_path)
+    else:
+        img = img_or_path
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, dark = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)
+
+    # Mask to plot area
+    x0, y0, x1, y1 = plot_bbox
+    plot_mask = np.zeros_like(dark)
+    plot_mask[y0:y1, x0:x1] = dark[y0:y1, x0:x1]
+
+    # Exclude legend area
+    if legend_bbox:
+        lx0, ly0, lx1, ly1 = legend_bbox
+        plot_mask[ly0:ly1, lx0:lx1] = 0
+
+    # Morphological erosion → dilation
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    eroded = cv2.erode(plot_mask, kernel, iterations=erode_iterations)
+    dilated = cv2.dilate(eroded, kernel, iterations=erode_iterations)
+
+    # Find contours and filter
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)
+
+    min_area, max_area = area_range
+    min_aspect, max_aspect = aspect_range
+    markers = []
+
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < min_area or area > max_area:
+            continue
+
+        x, y, bw, bh = cv2.boundingRect(c)
+        if bw > max_dim or bh > max_dim:
+            continue
+
+        aspect = bw / bh if bh > 0 else 0
+        if aspect < min_aspect or aspect > max_aspect:
+            continue
+
+        # Centroid via moments (works for hollow markers too)
+        M = cv2.moments(c)
+        if M["m00"] == 0:
+            continue
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+
+        markers.append((cx, cy, area, bw, bh))
+
+    # Sort by x position
+    markers.sort(key=lambda m: m[0])
+    return markers
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  15. MARKER CLUSTERING & SERIES ASSIGNMENT
+# ═══════════════════════════════════════════════════════════════════
+
+def cluster_markers_by_x(markers, tolerance=25):
+    """
+    Group detected markers into X-position clusters (one cluster per
+    categorical X value or tick mark).
+
+    Args:
+        markers: list of (cx, cy, ...) tuples from detect_markers_morphological
+        tolerance: max pixel distance to merge into same X group
+
+    Returns:
+        list of groups, each group is a list of marker tuples,
+        sorted by average X of each group, markers within each group sorted by cy
+    """
+    if not markers:
+        return []
+
+    sorted_markers = sorted(markers, key=lambda m: m[0])
+    groups = [[sorted_markers[0]]]
+
+    for m in sorted_markers[1:]:
+        if m[0] - groups[-1][-1][0] < tolerance:
+            groups[-1].append(m)
+        else:
+            groups.append([m])
+
+    # Sort markers within each group by Y (top to bottom)
+    for g in groups:
+        g.sort(key=lambda m: m[1])
+
+    return groups
+
+
+def assign_series_with_crossover(groups, n_series,
+                                  series_names=None,
+                                  initial_order="top_to_bottom"):
+    """
+    Assign markers in each X-group to series, handling curve crossovers.
+
+    When curves cross, the top-to-bottom order of markers changes.
+    This function tracks continuity by minimizing the total vertical
+    displacement from the previous group's assignments.
+
+    Args:
+        groups: list of marker groups from cluster_markers_by_x
+        n_series: expected number of series
+        series_names: list of series names (default: ["Series_1", ...])
+        initial_order: "top_to_bottom" assigns first group markers from top (smallest cy)
+                       to bottom as series 0, 1, 2, ...
+
+    Returns:
+        dict mapping series_name → list of (cx, cy) for each X group.
+        Missing values (e.g., overlapping markers) are filled with None.
+    """
+    if series_names is None:
+        series_names = [f"Series_{i + 1}" for i in range(n_series)]
+
+    result = {name: [] for name in series_names}
+
+    # Previous group's Y values per series (for continuity tracking)
+    prev_y = None
+
+    for group in groups:
+        n_found = len(group)
+
+        if n_found == n_series:
+            if prev_y is None:
+                # First group: assign by initial order
+                if initial_order == "top_to_bottom":
+                    assignment = list(range(n_series))
+                else:
+                    assignment = list(range(n_series - 1, -1, -1))
+            else:
+                # Minimize total displacement from previous positions
+                from itertools import permutations
+                group_ys = [m[1] for m in group]
+                best_perm = None
+                best_cost = float("inf")
+                for perm in permutations(range(n_series)):
+                    cost = sum(abs(group_ys[perm[i]] - prev_y[i])
+                               for i in range(n_series) if prev_y[i] is not None)
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_perm = perm
+
+                assignment = list(best_perm)
+
+            for series_idx in range(n_series):
+                marker_idx = assignment[series_idx]
+                m = group[marker_idx]
+                result[series_names[series_idx]].append((m[0], m[1]))
+
+            prev_y = [None] * n_series
+            for series_idx in range(n_series):
+                prev_y[series_idx] = group[assignment[series_idx]][1]
+
+        elif n_found < n_series:
+            # Fewer markers than expected (overlapping markers)
+            # Assign what we can, fill rest with None
+            if prev_y is not None and n_found > 0:
+                group_ys = [m[1] for m in group]
+                # Greedy assignment: match each found marker to nearest expected
+                assigned = set()
+                for m in group:
+                    best_idx = None
+                    best_dist = float("inf")
+                    for i in range(n_series):
+                        if i not in assigned and prev_y[i] is not None:
+                            d = abs(m[1] - prev_y[i])
+                            if d < best_dist:
+                                best_dist = d
+                                best_idx = i
+                    if best_idx is not None:
+                        assigned.add(best_idx)
+                        result[series_names[best_idx]].append((m[0], m[1]))
+                        if prev_y is not None:
+                            prev_y[best_idx] = m[1]
+
+                # Fill unassigned series with None
+                for i in range(n_series):
+                    if i not in assigned:
+                        result[series_names[i]].append(None)
+            else:
+                # No previous context, assign top-to-bottom
+                for i in range(n_found):
+                    result[series_names[i]].append((group[i][0], group[i][1]))
+                for i in range(n_found, n_series):
+                    result[series_names[i]].append(None)
+
+                if prev_y is None:
+                    prev_y = [None] * n_series
+                for i in range(n_found):
+                    prev_y[i] = group[i][1]
+        else:
+            # More markers than expected — possible noise, take the n_series
+            # with largest area
+            sorted_by_area = sorted(group, key=lambda m: m[2], reverse=True)
+            trimmed = sorted(sorted_by_area[:n_series], key=lambda m: m[1])
+            # Recurse with trimmed group
+            temp_groups = [trimmed]
+            temp_result = assign_series_with_crossover(
+                temp_groups, n_series, series_names, initial_order)
+            for name in series_names:
+                result[name].extend(temp_result[name])
+            if prev_y is None:
+                prev_y = [None] * n_series
+            for i, m in enumerate(trimmed):
+                prev_y[i] = m[1]
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  16. VALIDATION PLOT
 # ═══════════════════════════════════════════════════════════════════
 
 def create_validation_plot(original_img_path, data_points, output_path,
@@ -953,7 +1291,7 @@ def create_validation_plot(original_img_path, data_points, output_path,
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  14. CLI INTERFACE
+#  17. CLI INTERFACE
 # ═══════════════════════════════════════════════════════════════════
 
 def parse_color(color_str):
